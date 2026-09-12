@@ -376,18 +376,78 @@ test("领用校验：缺字段、非法数量、不存在配件/钟表", async (
   assert.match(unknownClock.body.error, /钟表不存在/);
 });
 
-test("配件登记校验：名称/规格/库存/阈值必填且数量合法", async () => {
-  const missing = await request("POST", "/parts", { name: "只有名称" });
-  assert.equal(missing.status, 400);
-  assert.match(missing.body.error, /spec|stockQuantity|warningThreshold/);
+test("配件登记校验：四字段的 null/非法类型/负数/缺失一律拒绝，失败不写入", async () => {
+  const valid = {
+    name: "标准发条",
+    spec: "12x0.8x320",
+    stockQuantity: 5,
+    warningThreshold: 2
+  };
 
-  const negative = await request("POST", "/parts", {
-    name: "负数件",
-    spec: "X",
-    stockQuantity: -1,
-    warningThreshold: 1
-  });
-  assert.equal(negative.status, 400);
+  const before = (await request("GET", "/parts")).body.data.length;
+
+  const invalidCases = [
+    // 名称：null、非字符串、空串
+    [{ ...valid, name: null }, /名称/],
+    [{ ...valid, name: 123 }, /名称/],
+    [{ ...valid, name: true }, /名称/],
+    [{ ...valid, name: { zh: "发条" } }, /名称/],
+    [{ ...valid, name: ["发条"] }, /名称/],
+    [{ ...valid, name: "" }, /名称|缺少/],
+    [{ ...valid, name: "   " }, /名称/],
+    // 规格：null、非字符串、空串
+    [{ ...valid, spec: null }, /规格/],
+    [{ ...valid, spec: 42 }, /规格/],
+    [{ ...valid, spec: false }, /规格/],
+    [{ ...valid, spec: { s: 1 } }, /规格/],
+    [{ ...valid, spec: "" }, /规格|缺少/],
+    // 库存数量：null、非整数、字符串、布尔、负数
+    [{ ...valid, stockQuantity: null }, /库存数量/],
+    [{ ...valid, stockQuantity: 1.5 }, /库存数量/],
+    [{ ...valid, stockQuantity: "5" }, /库存数量/],
+    [{ ...valid, stockQuantity: true }, /库存数量/],
+    [{ ...valid, stockQuantity: -1 }, /库存数量/],
+    [{ ...valid, stockQuantity: -0.5 }, /库存数量/],
+    // 预警阈值：null、非整数、字符串、布尔、负数
+    [{ ...valid, warningThreshold: null }, /预警阈值/],
+    [{ ...valid, warningThreshold: 2.5 }, /预警阈值/],
+    [{ ...valid, warningThreshold: "2" }, /预警阈值/],
+    [{ ...valid, warningThreshold: true }, /预警阈值/],
+    [{ ...valid, warningThreshold: -3 }, /预警阈值/]
+  ];
+
+  for (const [payload, pattern] of invalidCases) {
+    const res = await request("POST", "/parts", payload);
+    assert.equal(res.status, 400, `非法输入应被拒绝：${JSON.stringify(payload)}，实际：${res.raw}`);
+    assert.match(res.body.error, pattern);
+  }
+
+  // 字段逐个缺失：仍按必填处理，错误信息包含字段名
+  for (const field of ["name", "spec", "stockQuantity", "warningThreshold"]) {
+    const payload = { ...valid };
+    delete payload[field];
+    const res = await request("POST", "/parts", payload);
+    assert.equal(res.status, 400, `缺失 ${field} 应被拒绝`);
+    assert.match(res.body.error, new RegExp(field === "name" ? "name|名称" : field === "spec" ? "spec|规格" : field));
+  }
+
+  // 所有失败请求都没有写入配件记录
+  const after = (await request("GET", "/parts")).body.data.length;
+  assert.equal(after, before, "失败的登记请求不应产生配件记录");
+
+  // 合法值：包含边界值 0 库存 / 0 阈值
+  for (const payload of [
+    valid,
+    { ...valid, name: "零库存件", stockQuantity: 0 },
+    { ...valid, name: "零阈值件", spec: "Z0", warningThreshold: 0 }
+  ]) {
+    const res = await request("POST", "/parts", payload);
+    assert.equal(res.status, 201, `合法输入应登记成功：${JSON.stringify(payload)}，实际：${res.raw}`);
+    assert.equal(res.body.data.name, payload.name);
+    assert.equal(res.body.data.stockQuantity, payload.stockQuantity);
+    assert.equal(res.body.data.warningThreshold, payload.warningThreshold);
+    assert.equal(typeof res.body.data.id, "string");
+  }
 });
 
 test("旧接口回归：钟表/调校/复测闭环不受影响", async () => {

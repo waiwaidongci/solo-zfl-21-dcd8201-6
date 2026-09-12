@@ -131,24 +131,31 @@ function required(body, fields) {
   }
 }
 
+function requiredString(value, field) {
+  if (typeof value !== "string" || value.trim() === "") {
+    const error = new Error(`${field}必须是非空字符串`);
+    error.status = 400;
+    throw error;
+  }
+  return value;
+}
+
 function nonNegativeInt(value, field) {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     const error = new Error(`${field}必须是不小于0的整数`);
     error.status = 400;
     throw error;
   }
-  return n;
+  return value;
 }
 
 function positiveInt(value, field) {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
     const error = new Error(`${field}必须是正整数`);
     error.status = 400;
     throw error;
   }
-  return n;
+  return value;
 }
 
 function findClock(db, clockId) {
@@ -320,12 +327,17 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/parts") {
     const body = await parseBody(req);
     required(body, ["name", "spec", "stockQuantity", "warningThreshold"]);
+    // 显式类型校验：null/非字符串、null/非整数/负数一律拒绝
+    const name = requiredString(body.name, "名称");
+    const spec = requiredString(body.spec, "规格");
+    const stockQuantity = nonNegativeInt(body.stockQuantity, "库存数量");
+    const warningThreshold = nonNegativeInt(body.warningThreshold, "预警阈值");
     const part = {
       id: makeId("part"),
-      name: String(body.name),
-      spec: String(body.spec),
-      stockQuantity: nonNegativeInt(body.stockQuantity, "库存数量"),
-      warningThreshold: nonNegativeInt(body.warningThreshold, "预警阈值"),
+      name,
+      spec,
+      stockQuantity,
+      warningThreshold,
       createdAt: new Date().toISOString()
     };
     return withLock(async () => {

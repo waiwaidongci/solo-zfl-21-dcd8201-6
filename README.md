@@ -42,7 +42,7 @@ curl -X POST http://127.0.0.1:3021/parts \
   -d '{"name":"发条","spec":"12x0.8x320","stockQuantity":10,"warningThreshold":3}'
 ```
 
-字段：`name` 登记名称、`spec` 规格、`stockQuantity` 库存数量（非负整数）、`warningThreshold` 预警阈值（非负整数），均必填。
+字段：`name` 登记名称、`spec` 规格（均为非空字符串，传 `null` 或非字符串返回 400）、`stockQuantity` 库存数量、`warningThreshold` 预警阈值（均为不小于 0 的整数，传 `null`、非整数、负数或非数字类型返回 400）。四个字段均必填；校验失败的请求不会写入配件记录。
 
 ## 领用配件
 
