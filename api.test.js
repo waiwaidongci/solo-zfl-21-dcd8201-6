@@ -10,9 +10,9 @@ let baseUrl;
 let child;
 let tmpDir;
 
-function request(method, urlPath, body) {
+function request(method, urlPath, body, opts = {}) {
   return new Promise((resolve, reject) => {
-    const payload = body === undefined ? null : JSON.stringify(body);
+    const payload = opts.rawBody !== undefined ? opts.rawBody : body === undefined ? null : JSON.stringify(body);
     const req = http.request(
       `${baseUrl}${urlPath}`,
       {
@@ -448,6 +448,78 @@ test("配件登记校验：四字段的 null/非法类型/负数/缺失一律拒
     assert.equal(res.body.data.warningThreshold, payload.warningThreshold);
     assert.equal(typeof res.body.data.id, "string");
   }
+});
+
+test("配件登记请求体：null/空请求体返回明确400且不写入，正常登记成功", async () => {
+  const before = (await request("GET", "/parts")).body.data.length;
+
+  // 客户端只发送字面量 null
+  const nullBody = await request("POST", "/parts", null, { rawBody: "null" });
+  assert.equal(nullBody.status, 400, nullBody.raw);
+  assert.match(nullBody.body.error, /请求体|JSON|name/);
+
+  // 空请求体（无 body）
+  const empty = await request("POST", "/parts");
+  assert.equal(empty.status, 400, empty.raw);
+  assert.match(empty.body.error, /缺少字段/);
+
+  // 非法 JSON 文本仍按原规则 400
+  const malformed = await request("POST", "/parts", null, { rawBody: "{not-json" });
+  assert.equal(malformed.status, 400, malformed.raw);
+  assert.match(malformed.body.error, /合法JSON/);
+
+  // 非对象 JSON（数字、字符串、数组）也给出明确 400
+  for (const raw of ["123", '"发条"', "[]"]) {
+    const res = await request("POST", "/parts", null, { rawBody: raw });
+    assert.equal(res.status, 400, `请求体 ${raw} 应被拒绝，实际：${res.raw}`);
+    assert.match(res.body.error, /请求体/);
+  }
+
+  // 失败请求均未写入
+  const afterRejects = (await request("GET", "/parts")).body.data.length;
+  assert.equal(afterRejects, before, "非法请求体不应产生配件记录");
+
+  // 正常登记不受影响
+  const ok = await request("POST", "/parts", {
+    name: "请求体正常件",
+    spec: "B1",
+    stockQuantity: 4,
+    warningThreshold: 1
+  });
+  assert.equal(ok.status, 201, ok.raw);
+  assert.equal(ok.body.data.name, "请求体正常件");
+
+  const afterOk = (await request("GET", "/parts")).body.data.length;
+  assert.equal(afterOk, before + 1);
+});
+
+test("旧接口回归（本轮）：health/历史/登记/调校/复测闭环正常", async () => {
+  const health = await request("GET", "/health");
+  assert.equal(health.status, 200);
+
+  // 种子钟表历史仍可读
+  const history = await request("GET", "/clocks/clock_demo/history");
+  assert.equal(history.status, 200);
+  assert.equal(history.body.data.clock.id, "clock_demo");
+
+  // 旧登记接口正常登记仍可用
+  const clock = await createClock();
+  assert.ok(clock.id);
+
+  // 调校、复测闭环正常
+  const adj = await request("POST", `/clocks/${clock.id}/adjustments`, {
+    currentDailyRateSeconds: 33,
+    direction: "慢针方向",
+    amount: "微调0.2格"
+  });
+  assert.equal(adj.status, 201, adj.raw);
+
+  const retest = await request("POST", `/clocks/${clock.id}/retests`, {
+    dailyRateSeconds: 10,
+    amplitude: 255
+  });
+  assert.equal(retest.status, 201, retest.raw);
+  assert.equal(retest.body.data.qualified, true);
 });
 
 test("旧接口回归：钟表/调校/复测闭环不受影响", async () => {

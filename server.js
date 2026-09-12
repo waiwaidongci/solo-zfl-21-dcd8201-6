@@ -326,6 +326,12 @@ async function handle(req, res) {
 
   if (req.method === "POST" && pathname === "/parts") {
     const body = await parseBody(req);
+    // 请求体为字面量 null 或非对象（如 "x"、123、[]）时给出明确 400，避免落入 500
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      const error = new Error("请求体必须是JSON对象，包含配件字段：name、spec、stockQuantity、warningThreshold");
+      error.status = 400;
+      throw error;
+    }
     required(body, ["name", "spec", "stockQuantity", "warningThreshold"]);
     // 显式类型校验：null/非字符串、null/非整数/负数一律拒绝
     const name = requiredString(body.name, "名称");
