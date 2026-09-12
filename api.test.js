@@ -162,7 +162,7 @@ test("并发领用：库存不超卖，成功者数量之和等于库存", async
   assert.equal(refreshed.stockQuantity, 0);
 });
 
-test("重复提交：同一 requestId 不重复扣减，返回首次记录与 duplicated=true", async () => {
+test("正常重复提交：同一配件同一 requestId 不重复扣减，返回首次记录与 duplicated=true", async () => {
   const part = await createPart({ name: "重复垫片", spec: "D1", stockQuantity: 4, warningThreshold: 1 });
   const payload = { requestId: "req-idem-1", quantity: 3 };
 
@@ -190,6 +190,116 @@ test("重复提交：同一 requestId 不重复扣减，返回首次记录与 du
   assert.equal(ids[0], ids[1]);
   const stock = (await request("GET", "/parts")).body.data.find((p) => p.id === part2.id);
   assert.equal(stock.stockQuantity, 0);
+});
+
+test("跨钟表调校关联：调校不属于该钟表时返回400且不扣库存", async () => {
+  const clockA = await createClock();
+  const clockB = await createClock();
+
+  const adjA = await request("POST", `/clocks/${clockA.id}/adjustments`, {
+    currentDailyRateSeconds: 40,
+    direction: "慢针方向",
+    amount: "钟表A的调校"
+  });
+  assert.equal(adjA.status, 201, adjA.raw);
+
+  const part = await createPart({ name: "错配齿轮", spec: "M1", stockQuantity: 3, warningThreshold: 1 });
+
+  // clockId=B 但 adjustmentId 属于 A → 明确客户端错误
+  const mismatch = await request("POST", `/parts/${part.id}/usages`, {
+    requestId: "req-mismatch-1",
+    quantity: 1,
+    clockId: clockB.id,
+    adjustmentId: adjA.body.data.id
+  });
+  assert.equal(mismatch.status, 400, mismatch.raw);
+  assert.equal(mismatch.body.code, "CLOCK_ADJUSTMENT_MISMATCH");
+  assert.match(mismatch.body.error, /不匹配/);
+  assert.ok(mismatch.body.error.includes(clockA.id));
+  assert.ok(mismatch.body.error.includes(clockB.id));
+
+  // 不扣库存、不生成明细
+  const stock = (await request("GET", "/parts")).body.data.find((p) => p.id === part.id);
+  assert.equal(stock.stockQuantity, 3);
+  const usages = await request("GET", `/part-usages?partId=${part.id}`);
+  assert.equal(usages.body.data.length, 0);
+
+  // 被拒绝的请求未占用幂等键：同一 requestId 用正确归属重新提交应成功
+  const fixed = await request("POST", `/parts/${part.id}/usages`, {
+    requestId: "req-mismatch-1",
+    quantity: 1,
+    clockId: clockA.id,
+    adjustmentId: adjA.body.data.id
+  });
+  assert.equal(fixed.status, 201, fixed.raw);
+  assert.equal(fixed.body.data.clockId, clockA.id);
+
+  // 只提交调校记录时，归属钟表自动取调校记录所属钟表
+  const part2 = await createPart({ name: "错配齿轮2", spec: "M2", stockQuantity: 2, warningThreshold: 0 });
+  const inferred = await request("POST", `/parts/${part2.id}/usages`, {
+    requestId: "req-mismatch-2",
+    quantity: 1,
+    adjustmentId: adjA.body.data.id
+  });
+  assert.equal(inferred.status, 201, inferred.raw);
+  assert.equal(inferred.body.data.clockId, clockA.id);
+});
+
+test("跨配件幂等键复用：同键换配件按新请求处理，各自只扣一次", async () => {
+  const partX = await createPart({ name: "配件X", spec: "X1", stockQuantity: 3, warningThreshold: 1 });
+  const partY = await createPart({ name: "配件Y", spec: "Y1", stockQuantity: 3, warningThreshold: 1 });
+
+  // 同一 requestId 先用于配件X
+  const onX = await request("POST", `/parts/${partX.id}/usages`, {
+    requestId: "req-shared-key",
+    quantity: 1
+  });
+  assert.equal(onX.status, 201, onX.raw);
+  assert.equal(onX.body.data.partId, partX.id);
+
+  // 同一个键换到配件Y：按新请求处理，Y 也扣减
+  const onY = await request("POST", `/parts/${partY.id}/usages`, {
+    requestId: "req-shared-key",
+    quantity: 1
+  });
+  assert.equal(onY.status, 201, onY.raw);
+  assert.equal(onY.body.duplicated, false);
+  assert.equal(onY.body.data.partId, partY.id);
+  assert.notEqual(onX.body.data.id, onY.body.data.id);
+
+  // 各自重复提交：返回各自首次记录，库存不再变动
+  const replayX = await request("POST", `/parts/${partX.id}/usages`, {
+    requestId: "req-shared-key",
+    quantity: 1
+  });
+  assert.equal(replayX.status, 200);
+  assert.equal(replayX.body.duplicated, true);
+  assert.equal(replayX.body.data.id, onX.body.data.id);
+  assert.equal(replayX.body.part.stockQuantity, 2);
+
+  const replayY = await request("POST", `/parts/${partY.id}/usages`, {
+    requestId: "req-shared-key",
+    quantity: 1
+  });
+  assert.equal(replayY.status, 200);
+  assert.equal(replayY.body.duplicated, true);
+  assert.equal(replayY.body.data.id, onY.body.data.id);
+  assert.equal(replayY.body.part.stockQuantity, 2);
+
+  // 同键换到第三个库存不足的配件：作为新请求被库存规则拒绝，不返回X的旧记录
+  const partZ = await createPart({ name: "配件Z", spec: "Z1", stockQuantity: 0, warningThreshold: 0 });
+  const onZ = await request("POST", `/parts/${partZ.id}/usages`, {
+    requestId: "req-shared-key",
+    quantity: 1
+  });
+  assert.equal(onZ.status, 409);
+  assert.equal(onZ.body.code, "INSUFFICIENT_STOCK");
+
+  // 两条明细各自独立可查
+  const all = await request("GET", "/part-usages?requestId=req-shared-key");
+  assert.equal(all.status, 200);
+  const partIds = all.body.data.map((u) => u.partId).sort();
+  assert.deepEqual(partIds, [partX.id, partY.id].sort());
 });
 
 test("库存不足：拒绝领用并返回明确错误，库存不变", async () => {

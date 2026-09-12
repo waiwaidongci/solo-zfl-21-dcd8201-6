@@ -359,20 +359,36 @@ async function handle(req, res) {
       const latest = await readDb();
       const part = findPart(latest, partId);
 
-      // 幂等：同一 requestId 重复提交直接返回首次记录，不重复扣减
-      const existing = latest.partUsages.find((item) => item.requestId === requestId);
+      // 幂等键绑定配件：同一 requestId 在同一配件下重复提交返回首次记录，不重复扣减；
+      // 同一个键换到另一个配件视为新请求，正常校验扣减。
+      const existing = latest.partUsages.find(
+        (item) => item.requestId === requestId && item.partId === part.id
+      );
       if (existing) {
-        return send(res, 200, { duplicated: true, data: existing, part: partSummary(findPart(latest, existing.partId)) });
+        return send(res, 200, { duplicated: true, data: existing, part: partSummary(part) });
       }
 
-      if (body.clockId) findClock(latest, String(body.clockId));
-      if (body.adjustmentId) {
-        const adjustment = latest.adjustments.find((item) => item.id === body.adjustmentId);
+      // 关联的钟表与调校记录必须存在且属于同一只钟表（错误不落盘、不扣库存）
+      let clockId = body.clockId ? String(body.clockId) : null;
+      let adjustmentId = body.adjustmentId ? String(body.adjustmentId) : null;
+      if (clockId) findClock(latest, clockId);
+      if (adjustmentId) {
+        const adjustment = latest.adjustments.find((item) => item.id === adjustmentId);
         if (!adjustment) {
           const error = new Error("调校记录不存在");
           error.status = 404;
           throw error;
         }
+        if (clockId && adjustment.clockId !== clockId) {
+          const error = new Error(
+            `钟表与调校记录不匹配：调校记录 ${adjustmentId} 属于钟表 ${adjustment.clockId}，与提交的钟表 ${clockId} 不一致`
+          );
+          error.status = 400;
+          error.code = "CLOCK_ADJUSTMENT_MISMATCH";
+          throw error;
+        }
+        // 仅提交调校记录时，归属钟表以调校记录为准
+        clockId = adjustment.clockId;
       }
 
       if (part.stockQuantity < quantity) {
@@ -392,8 +408,8 @@ async function handle(req, res) {
         partName: part.name,
         partSpec: part.spec,
         quantity,
-        clockId: body.clockId ? String(body.clockId) : null,
-        adjustmentId: body.adjustmentId ? String(body.adjustmentId) : null,
+        clockId,
+        adjustmentId,
         note: body.note || "",
         createdAt: new Date().toISOString()
       };
