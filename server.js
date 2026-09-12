@@ -369,6 +369,13 @@ async function handle(req, res) {
   if (partUsageMatch && req.method === "POST") {
     const partId = partUsageMatch[1];
     const body = await parseBody(req);
+    // 请求体为字面量 null 或非对象（数字、字符串、数组）时给出明确 400，
+    // 在进入领用事务之前拦截：不扣库存、不生成领用记录。
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      const error = new Error("请求体必须是JSON对象，包含领用字段：requestId、quantity");
+      error.status = 400;
+      throw error;
+    }
     required(body, ["requestId", "quantity"]);
     const requestId = String(body.requestId);
     const quantity = positiveInt(body.quantity, "领用数量");

@@ -376,6 +376,78 @@ test("领用校验：缺字段、非法数量、不存在配件/钟表", async (
   assert.match(unknownClock.body.error, /钟表不存在/);
 });
 
+test("领用请求体：null/非对象JSON/空请求体返回明确400，不扣库存不生成记录", async () => {
+  const part = await createPart({ name: "请求体配件", spec: "B1", stockQuantity: 3, warningThreshold: 1 });
+  const stockBefore = (await request("GET", "/parts")).body.data.find((p) => p.id === part.id).stockQuantity;
+  const usagesBefore = (await request("GET", `/part-usages?partId=${part.id}`)).body.data.length;
+
+  // 字面量 null
+  const nullBody = await request("POST", `/parts/${part.id}/usages`, null, { rawBody: "null" });
+  assert.equal(nullBody.status, 400, nullBody.raw);
+  assert.match(nullBody.body.error, /请求体|requestId/);
+
+  // 数字、字符串、数组形式的 JSON
+  for (const raw of ["123", '"领用"', "[]"]) {
+    const res = await request("POST", `/parts/${part.id}/usages`, null, { rawBody: raw });
+    assert.equal(res.status, 400, `请求体 ${raw} 应被拒绝，实际：${res.raw}`);
+    assert.match(res.body.error, /请求体/);
+  }
+
+  // 非法 JSON 文本
+  const malformed = await request("POST", `/parts/${part.id}/usages`, null, { rawBody: "{oops" });
+  assert.equal(malformed.status, 400, malformed.raw);
+  assert.match(malformed.body.error, /合法JSON/);
+
+  // 空请求体（无 body）
+  const empty = await request("POST", `/parts/${part.id}/usages`);
+  assert.equal(empty.status, 400, empty.raw);
+  assert.match(empty.body.error, /缺少字段/);
+
+  // 库存与明细均无变化
+  const stockAfter = (await request("GET", "/parts")).body.data.find((p) => p.id === part.id).stockQuantity;
+  assert.equal(stockAfter, stockBefore);
+  const usagesAfter = (await request("GET", `/part-usages?partId=${part.id}`)).body.data.length;
+  assert.equal(usagesAfter, usagesBefore);
+
+  // 正常领用仍然成功，且此前被拒绝的请求未占用任何键
+  const ok = await request("POST", `/parts/${part.id}/usages`, { requestId: "req-body-ok", quantity: 2 });
+  assert.equal(ok.status, 201, ok.raw);
+  assert.equal(ok.body.part.stockQuantity, stockBefore - 2);
+});
+
+test("旧接口回归（领用请求体本轮）：health/历史/调校/复测与查询接口正常", async () => {
+  const health = await request("GET", "/health");
+  assert.equal(health.status, 200);
+
+  const history = await request("GET", "/clocks/clock_demo/history");
+  assert.equal(history.status, 200);
+  assert.equal(history.body.data.clock.id, "clock_demo");
+  assert.ok(Array.isArray(history.body.data.adjustments));
+
+  const clock = await createClock();
+  const adj = await request("POST", `/clocks/${clock.id}/adjustments`, {
+    currentDailyRateSeconds: 28,
+    direction: "慢针方向",
+    amount: "微调0.1格"
+  });
+  assert.equal(adj.status, 201, adj.raw);
+
+  const retest = await request("POST", `/clocks/${clock.id}/retests`, {
+    dailyRateSeconds: 8,
+    amplitude: 260,
+    adjustmentId: adj.body.data.id
+  });
+  assert.equal(retest.status, 201, retest.raw);
+  assert.equal(retest.body.data.qualified, true);
+
+  const latest = await request("GET", `/clocks/${clock.id}/latest-retest`);
+  assert.equal(latest.status, 200);
+  assert.equal(latest.body.data.id, retest.body.data.id);
+
+  const retests = await request("GET", `/retests?clockId=${clock.id}&qualified=true`);
+  assert.equal(retests.body.data.length, 1);
+});
+
 test("配件登记校验：四字段的 null/非法类型/负数/缺失一律拒绝，失败不写入", async () => {
   const valid = {
     name: "标准发条",

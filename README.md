@@ -54,6 +54,7 @@ curl -X POST http://127.0.0.1:3021/parts/part_xxx/usages \
 
 规则：
 
+- 请求体必须是 JSON 对象；只发送 `null`、数字、字符串或数组返回 400，不扣库存、不生成领用记录。
 - `requestId`（必填）为客户端生成的领用请求标识，**幂等键绑定配件**：同一 `requestId` 在同一配件下重复提交返回首次记录（`duplicated: true`，HTTP 200），不重复扣减，并发重复提交同样只扣一次；同一个键换到另一个配件提交则按新请求处理。
 - `quantity` 必填且为正整数；`clockId`、`adjustmentId` 可选，用于关联钟表与调校记录。钟表不存在返回 404，调校记录不存在返回 404；**钟表与调校记录不属于同一只钟表时返回 400（`code: "CLOCK_ADJUSTMENT_MISMATCH"`）且不扣库存**。只提交 `adjustmentId` 时，归属钟表自动取调校记录所属钟表。
 - **库存不足拒绝领用**：HTTP 409，响应体 `{"error":"配件库存不足：…当前库存 X，申请领用 Y","code":"INSUFFICIENT_STOCK"}`，库存与明细均不变。
