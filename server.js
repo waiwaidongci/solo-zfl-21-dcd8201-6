@@ -1,9 +1,11 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3021);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE
+  ? path.resolve(process.env.DB_FILE)
+  : path.join(__dirname, "data", "db.json");
 
 const initialData = {
   clocks: [
@@ -39,7 +41,9 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  parts: [],
+  partUsages: []
 };
 
 const routes = [
@@ -52,7 +56,12 @@ const routes = [
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "POST /parts",
+  "GET /parts",
+  "GET /parts/low-stock",
+  "POST /parts/:id/usages",
+  "GET /part-usages"
 ];
 
 async function ensureDb() {
@@ -66,11 +75,29 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  // 兼容旧数据文件：补齐新增集合
+  if (!Array.isArray(db.parts)) db.parts = [];
+  if (!Array.isArray(db.partUsages)) db.partUsages = [];
+  return db;
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  // 同目录临时文件 + rename，保证落盘原子性
+  const tmp = `${DB_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  await writeFile(tmp, JSON.stringify(data, null, 2));
+  await rename(tmp, DB_FILE);
+}
+
+// 进程内串行写锁：领用事务（查重→校验库存→扣减→落盘）在锁内完成，避免并发超卖
+let writeChain = Promise.resolve();
+function withLock(task) {
+  const run = writeChain.then(task, task);
+  writeChain = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
 }
 
 function send(res, status, body) {
@@ -104,6 +131,26 @@ function required(body, fields) {
   }
 }
 
+function nonNegativeInt(value, field) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    const error = new Error(`${field}必须是不小于0的整数`);
+    error.status = 400;
+    throw error;
+  }
+  return n;
+}
+
+function positiveInt(value, field) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) {
+    const error = new Error(`${field}必须是正整数`);
+    error.status = 400;
+    throw error;
+  }
+  return n;
+}
+
 function findClock(db, clockId) {
   const clock = db.clocks.find((item) => item.id === clockId);
   if (!clock) {
@@ -112,6 +159,23 @@ function findClock(db, clockId) {
     throw error;
   }
   return clock;
+}
+
+function findPart(db, partId) {
+  const part = db.parts.find((item) => item.id === partId);
+  if (!part) {
+    const error = new Error("配件不存在");
+    error.status = 404;
+    throw error;
+  }
+  return part;
+}
+
+function partSummary(part) {
+  return {
+    ...part,
+    lowStock: part.stockQuantity <= part.warningThreshold
+  };
 }
 
 function latestRetest(db, clockId) {
@@ -251,13 +315,120 @@ async function handle(req, res) {
     return send(res, 200, { data });
   }
 
+  // ===== 配件库存 =====
+
+  if (req.method === "POST" && pathname === "/parts") {
+    const body = await parseBody(req);
+    required(body, ["name", "spec", "stockQuantity", "warningThreshold"]);
+    const part = {
+      id: makeId("part"),
+      name: String(body.name),
+      spec: String(body.spec),
+      stockQuantity: nonNegativeInt(body.stockQuantity, "库存数量"),
+      warningThreshold: nonNegativeInt(body.warningThreshold, "预警阈值"),
+      createdAt: new Date().toISOString()
+    };
+    return withLock(async () => {
+      const latest = await readDb();
+      latest.parts.push(part);
+      await writeDb(latest);
+      return send(res, 201, { data: partSummary(part) });
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/parts") {
+    return send(res, 200, { data: db.parts.map(partSummary) });
+  }
+
+  if (req.method === "GET" && pathname === "/parts/low-stock") {
+    const data = db.parts
+      .filter((part) => part.stockQuantity <= part.warningThreshold)
+      .map(partSummary);
+    return send(res, 200, { data });
+  }
+
+  const partUsageMatch = pathname.match(/^\/parts\/([^/]+)\/usages$/);
+  if (partUsageMatch && req.method === "POST") {
+    const partId = partUsageMatch[1];
+    const body = await parseBody(req);
+    required(body, ["requestId", "quantity"]);
+    const requestId = String(body.requestId);
+    const quantity = positiveInt(body.quantity, "领用数量");
+
+    return withLock(async () => {
+      const latest = await readDb();
+      const part = findPart(latest, partId);
+
+      // 幂等：同一 requestId 重复提交直接返回首次记录，不重复扣减
+      const existing = latest.partUsages.find((item) => item.requestId === requestId);
+      if (existing) {
+        return send(res, 200, { duplicated: true, data: existing, part: partSummary(findPart(latest, existing.partId)) });
+      }
+
+      if (body.clockId) findClock(latest, String(body.clockId));
+      if (body.adjustmentId) {
+        const adjustment = latest.adjustments.find((item) => item.id === body.adjustmentId);
+        if (!adjustment) {
+          const error = new Error("调校记录不存在");
+          error.status = 404;
+          throw error;
+        }
+      }
+
+      if (part.stockQuantity < quantity) {
+        const error = new Error(
+          `配件库存不足：配件「${part.name}(${part.spec})」当前库存 ${part.stockQuantity}，申请领用 ${quantity}`
+        );
+        error.status = 409;
+        error.code = "INSUFFICIENT_STOCK";
+        throw error;
+      }
+
+      part.stockQuantity -= quantity;
+      const usage = {
+        id: makeId("part_usage"),
+        requestId,
+        partId: part.id,
+        partName: part.name,
+        partSpec: part.spec,
+        quantity,
+        clockId: body.clockId ? String(body.clockId) : null,
+        adjustmentId: body.adjustmentId ? String(body.adjustmentId) : null,
+        note: body.note || "",
+        createdAt: new Date().toISOString()
+      };
+      latest.partUsages.push(usage);
+      await writeDb(latest);
+      return send(res, 201, { duplicated: false, data: usage, part: partSummary(part) });
+    });
+  }
+
+  if (req.method === "GET" && pathname === "/part-usages") {
+    const partId = url.searchParams.get("partId");
+    const clockId = url.searchParams.get("clockId");
+    const adjustmentId = url.searchParams.get("adjustmentId");
+    const requestId = url.searchParams.get("requestId");
+    const data = db.partUsages.filter((item) => {
+      return (!partId || item.partId === partId)
+        && (!clockId || item.clockId === clockId)
+        && (!adjustmentId || item.adjustmentId === adjustmentId)
+        && (!requestId || item.requestId === requestId);
+    });
+    return send(res, 200, { data });
+  }
+
   return send(res, 404, { error: "接口不存在", routes });
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) => send(res, error.status || 500, {
+    error: error.message || "服务器错误",
+    code: error.code
+  }));
 });
 
 server.listen(PORT, () => {
-  console.log(`Clock escapement tuning API running at http://127.0.0.1:${PORT}`);
+  console.log(`Clock escapement tuning API running at http://127.0.0.1:${server.address().port}`);
 });
+
+module.exports = { server, withLock, readDb, writeDb, DB_FILE };

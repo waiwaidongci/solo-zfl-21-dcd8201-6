@@ -1,14 +1,19 @@
 # 机械钟表擒纵调校API
 
-纯后端零依赖Node服务，使用 `data/db.json` 持久化钟表档案、调校记录和复测记录。
+纯后端零依赖Node服务，使用 `data/db.json` 持久化钟表档案、调校记录、复测记录、配件库存与领用明细。
 
 ## 启动
 
 ```bash
-PORT=3021 node server.js
+npm start            # 等价于 PORT=3021 node server.js
+npm test             # 运行接口测试（node:test，零依赖）
 ```
 
-## 主要接口
+可用环境变量：`PORT`（默认 3021）、`DB_FILE`（数据文件路径，默认 `data/db.json`）。
+
+## 接口列表
+
+钟表与调校（旧接口，保持不变）：
 
 - `GET /health`
 - `GET /clocks`
@@ -21,9 +26,46 @@ PORT=3021 node server.js
 - `GET /adjustments?clockId=`
 - `GET /retests?clockId=&qualified=`
 
+配件库存与领用（新增）：
+
+- `POST /parts` — 配件登记
+- `GET /parts` — 配件库存列表（含 `lowStock` 标记）
+- `GET /parts/low-stock` — 低库存列表（库存 ≤ 预警阈值）
+- `POST /parts/:id/usages` — 领用配件（调校时关联，幂等、库存校验）
+- `GET /part-usages?partId=&clockId=&adjustmentId=&requestId=` — 领用明细查询
+
+## 配件登记
+
+```bash
+curl -X POST http://127.0.0.1:3021/parts \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"发条","spec":"12x0.8x320","stockQuantity":10,"warningThreshold":3}'
+```
+
+字段：`name` 登记名称、`spec` 规格、`stockQuantity` 库存数量（非负整数）、`warningThreshold` 预警阈值（非负整数），均必填。
+
+## 领用配件
+
+```bash
+curl -X POST http://127.0.0.1:3021/parts/part_xxx/usages \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"req-20260912-001","quantity":2,"clockId":"clock_demo","adjustmentId":"adjustment_demo","note":"调校更换发条"}'
+```
+
+规则：
+
+- `requestId`（必填）为客户端生成的领用请求唯一标识。**同一 requestId 重复提交返回首次记录（`duplicated: true`，HTTP 200），不重复扣减**；并发重复提交同样只扣一次。
+- `quantity` 必填且为正整数；`clockId`、`adjustmentId` 可选，用于关联钟表与调校记录（不存在返回 404）。
+- **库存不足拒绝领用**：HTTP 409，响应体 `{"error":"配件库存不足：…当前库存 X，申请领用 Y","code":"INSUFFICIENT_STOCK"}`，库存与明细均不变。
+- 领用事务在服务端串行执行（查重 → 校验 → 扣减 → 原子落盘），并发领用不会超卖。
+
 ## 闭环示例
 
 ```bash
+# 查询低库存配件
+curl http://127.0.0.1:3021/parts/low-stock
+
+# 调校后复测
 curl http://127.0.0.1:3021/clocks/not-qualified
 curl -X POST http://127.0.0.1:3021/clocks/clock_demo/retests \
   -H 'Content-Type: application/json' \
